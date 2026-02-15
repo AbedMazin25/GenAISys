@@ -1,0 +1,44 @@
+# Environment secrets
+.env
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Directories to exclude (not part of this project's commit)
+python-3.13-docs-text/
+review_agent/
+
+# ChromaDB databases
+chroma_db_langchain/
+chroma_db_llamaindex/
+
+# Large log files
+*.log
+
+# Large binary / data files
+*.pdf
+*.sqlite3
+*.bin
+*.pt
+*.safetensors
+
+# Benchmark chart images (regeneratable)
+*.png
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
