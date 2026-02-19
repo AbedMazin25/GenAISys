@@ -56,22 +56,31 @@ class ContextManager:
             self._init_sentence_transformer()
     
     def _init_sentence_transformer(self):
-        """Initialize Math-BERT for math-specialized embeddings"""
+        """Initialize Math-BERT for math-specialized embeddings.
+        
+        Loads on GPU for fast embedding, then offloads to CPU before vLLM
+        claims the GPU.  Math-BERT is only ~440MB so GPU→CPU transfer is instant.
+        When embeddings are needed, _move_math_bert_to_gpu() moves it back
+        temporarily and _move_math_bert_to_cpu() frees VRAM afterwards.
+        """
         global _math_bert_model, _math_bert_tokenizer, _math_bert_loaded
         global _sentence_model, _sentence_model_loaded
         
         if _math_bert_loaded:
             return
         
+        # Limit CPU threads so Math-BERT CPU fallback doesn't contend with
+        # vLLM's hundreds of server threads.
+        torch.set_num_threads(2)
+        
         # Try to load Math-BERT first (preferred for math problems)
-        # Keep on CPU to avoid competing with vLLM for GPU memory
         try:
             _math_bert_tokenizer = AutoTokenizer.from_pretrained('AnReu/math_pretrained_bert')
             _math_bert_model = AutoModel.from_pretrained('AnReu/math_pretrained_bert')
             _math_bert_model.eval()
             
             _math_bert_loaded = True
-            print("[SUCCESS] Math-BERT (AnReu/math_pretrained_bert) initialized on CPU for adaptive context strategy")
+            print("[SUCCESS] Math-BERT (AnReu/math_pretrained_bert) initialized (will use GPU when available, CPU fallback)")
             return
         except Exception as e:
             print(f"Warning: Could not load Math-BERT: {e}")
@@ -94,8 +103,28 @@ class ContextManager:
             _sentence_model_loaded = True
             _math_bert_loaded = True
     
-    def _get_math_bert_embedding(self, text: str) -> np.ndarray:
-        """Get embedding from Math-BERT"""
+    @staticmethod
+    def _move_math_bert_to_gpu():
+        """Temporarily move Math-BERT to GPU for fast batch embedding."""
+        global _math_bert_model
+        if _math_bert_model is not None and torch.cuda.is_available():
+            try:
+                _math_bert_model = _math_bert_model.to('cuda')
+                return 'cuda'
+            except Exception:
+                pass  # GPU busy (vLLM) — stay on CPU
+        return 'cpu'
+
+    @staticmethod
+    def _move_math_bert_to_cpu():
+        """Offload Math-BERT back to CPU and free GPU memory for vLLM."""
+        global _math_bert_model
+        if _math_bert_model is not None and next(_math_bert_model.parameters()).is_cuda:
+            _math_bert_model = _math_bert_model.to('cpu')
+            torch.cuda.empty_cache()
+
+    def _get_math_bert_embedding(self, text: str, device: str = 'cpu') -> np.ndarray:
+        """Get embedding from Math-BERT on the given device."""
         global _math_bert_model, _math_bert_tokenizer
         
         if _math_bert_model is None:
@@ -109,23 +138,32 @@ class ContextManager:
                 max_length=512,
                 padding=True
             )
-            # Math-BERT runs on CPU (GPU reserved for vLLM)
+            if device == 'cuda':
+                inputs = {k: v.to('cuda') for k, v in inputs.items()}
             outputs = _math_bert_model(**inputs)
-            # Use [CLS] token embedding
-            embedding = outputs.last_hidden_state[:, 0, :].numpy()
+            # Use [CLS] token embedding → always return as numpy on CPU
+            embedding = outputs.last_hidden_state[:, 0, :].cpu().numpy()
             
         return embedding[0]
     
     def _get_embeddings(self, texts: List[str]) -> np.ndarray:
-        """Get embeddings using Math-BERT or fallback"""
+        """Get embeddings using Math-BERT (GPU if available) or fallback.
+        
+        Moves Math-BERT to GPU for the batch, then offloads to CPU so vLLM
+        can reclaim VRAM.  If GPU is busy, falls back to CPU transparently.
+        """
         global _math_bert_model, _sentence_model
         
         if _math_bert_model is not None:
-            embeddings = []
-            for text in texts:
-                emb = self._get_math_bert_embedding(text)
-                embeddings.append(emb)
-            return np.array(embeddings)
+            device = self._move_math_bert_to_gpu()
+            try:
+                embeddings = []
+                for text in texts:
+                    emb = self._get_math_bert_embedding(text, device)
+                    embeddings.append(emb)
+                return np.array(embeddings)
+            finally:
+                self._move_math_bert_to_cpu()
         elif _sentence_model is not None:
             return _sentence_model.encode(texts)
         else:
@@ -348,7 +386,9 @@ class ContextManager:
         # Create a cache key from example questions (order-independent)
         questions_str = "|".join(sorted(ex['question'] for ex in few_shot_examples))
         cache_hash = hashlib.md5(questions_str.encode()).hexdigest()[:12]
-        cache_file = os.path.join(os.path.dirname(__file__), f"_example_cache_{cache_hash}.npz")
+        cache_dir = os.path.join(os.path.dirname(__file__), "logs")
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = os.path.join(cache_dir, f"_example_cache_{cache_hash}.npz")
         
         # Try loading from disk
         if os.path.exists(cache_file):

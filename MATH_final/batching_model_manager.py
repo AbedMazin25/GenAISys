@@ -55,12 +55,79 @@ _current_model_id = None
 _tokenizer_cache = {}
 
 
+def _force_free_gpu_memory():
+    """Aggressively free ALL GPU memory before starting a new vLLM server.
+    
+    Kills any process holding GPU memory (orphaned vLLM, stale CUDA contexts),
+    then polls until at least 80% of VRAM is free (up to 60s).
+    """
+    import torch
+
+    # 1. Kill any orphaned vLLM / CUDA processes still holding memory
+    _kill_orphaned_vllm_processes()
+
+    # 2. Kill anything on the vLLM port
+    try:
+        subprocess.run(["fuser", "-k", f"{VLLM_PORT}/tcp"],
+                        timeout=10, capture_output=True)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # 3. Kill any other python processes holding GPU (except ourselves)
+    my_pid = os.getpid()
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.strip().split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                pid = int(line)
+                if pid != my_pid:
+                    os.kill(pid, signal.SIGKILL)
+                    print(f"  Killed GPU-holding process {pid}")
+            except (ValueError, ProcessLookupError, PermissionError):
+                pass
+    except Exception:
+        pass
+
+    # 4. Release our own CUDA context and poll until driver reclaims memory
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        torch.cuda.synchronize()
+        gc.collect()
+
+        total = torch.cuda.mem_get_info()[1]
+        threshold = total * 0.80  # need 80% free
+
+        for attempt in range(30):  # up to 60s
+            free, total = torch.cuda.mem_get_info()
+            if free >= threshold:
+                print(f"  GPU memory ready: {free/1024**3:.1f} GiB free / {total/1024**3:.1f} GiB total")
+                return
+            time.sleep(2)
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
+        free, total = torch.cuda.mem_get_info()
+        print(f"  ⚠️ GPU memory not fully released after 60s: {free/1024**3:.1f}/{total/1024**3:.1f} GiB free")
+
+
 def _start_vllm_server(model_id: str, max_model_len: int = 8192):
     """Start vLLM server natively on Linux for the given model."""
     global _vllm_process, _current_model_id
 
     # Stop existing server if running
     _stop_vllm_server()
+
+    # Aggressively free GPU memory before starting
+    _force_free_gpu_memory()
 
     print(f"Starting vLLM server for {model_id}...")
 
@@ -121,7 +188,8 @@ def _start_vllm_server(model_id: str, max_model_len: int = 8192):
                 print(f"vLLM log ({log_path}):\n{log_tail}")
             except Exception:
                 print(f"vLLM server process exited with code {_vllm_process.returncode}")
-            _vllm_process = None
+            finally:
+                _vllm_process = None
             return False
 
         time.sleep(VLLM_HEALTH_CHECK_INTERVAL)

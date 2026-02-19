@@ -284,8 +284,9 @@ class MathConcurrentBenchmark:
         
         # Debug mode configuration
         self.debug_mode = debug_mode
-        if debug_mode and selected_models:
-            # Filter to only selected models
+        
+        # Model selection (--models works with or without --debug)
+        if selected_models:
             self.models_to_test = [m for m in selected_models if m in self.available_models]
             if not self.models_to_test:
                 print(f"⚠️ None of the selected models {selected_models} are available!")
@@ -294,8 +295,8 @@ class MathConcurrentBenchmark:
         else:
             self.models_to_test = self.available_models
         
-        # Framework selection
-        if debug_mode and selected_frameworks:
+        # Framework selection (--frameworks works with or without --debug)
+        if selected_frameworks:
             self.frameworks_to_test = {k: v for k, v in self.available_frameworks.items() 
                                      if k in selected_frameworks}
             if not self.frameworks_to_test:
@@ -305,8 +306,8 @@ class MathConcurrentBenchmark:
         else:
             self.frameworks_to_test = self.available_frameworks
         
-        # Context length selection
-        if debug_mode and selected_context_lengths:
+        # Context length selection (--context-lengths works with or without --debug)
+        if selected_context_lengths:
             self.context_lengths = [l for l in selected_context_lengths if l in self.available_context_lengths]
             if not self.context_lengths:
                 print(f"⚠️ Invalid context lengths: {selected_context_lengths}")
@@ -314,8 +315,8 @@ class MathConcurrentBenchmark:
         else:
             self.context_lengths = self.available_context_lengths  # Test all: 512, 1024, 2048, 4096
         
-        # Context strategy selection
-        if debug_mode and selected_context_strategies:
+        # Context strategy selection (--context-strategies works with or without --debug)
+        if selected_context_strategies:
             self.context_strategies = [s for s in selected_context_strategies if s in self.available_context_strategies]
             if not self.context_strategies:
                 print(f"⚠️ Invalid context strategies: {selected_context_strategies}")
